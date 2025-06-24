@@ -1,0 +1,546 @@
+---
+title: "Brain Metastasis Dataset Consolidation and Preprocessing"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+# Clear global environment (preserve data.path and user if they exist)
+rm(list = setdiff(ls(), c("data.path", "user")))
+invisible({gc()})
+
+# Start timing the analysis
+start.time <- proc.time()
+
+# Load required packages
+packages_to_load <- c(
+  "Seurat", "sctransform", "Libra",
+  "dplyr", "tidyr", "RColorBrewer", "ggplot2", "gridExtra", 
+  "DT", "flexdashboard", "future", "biomaRt", "foreach", 
+  "parallel", "doParallel", "scMiko", "glmGamPoi"
+)
+
+# Load packages silently
+invisible({lapply(packages_to_load, library, character.only = TRUE)})
+```
+
+```{r data_directory}
+# Set main data directory
+data_dir <- "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/BrainMet/data/"
+```
+
+```{r helper_functions}
+#' Filter single-cell data based on quality metrics
+#' @param seurat_obj Seurat object to filter
+#' @return Filtered Seurat object
+filter_sc_data <- function(seurat_obj) {
+  seurat_obj <- getMitoContent(seurat_obj)
+  seurat_obj <- seurat_obj[, seurat_obj@meta.data$percent.mt < 10]
+  seurat_obj <- seurat_obj[, seurat_obj@meta.data$nFeature_RNA < 9000]
+  seurat_obj <- seurat_obj[, seurat_obj@meta.data$nFeature_RNA > 200]
+  return(seurat_obj)
+}
+
+#' Normalize list of Seurat objects using SCTransform
+#' @param seurat_list List of Seurat objects
+#' @param apply_filter Logical, whether to apply quality filtering
+#' @return List of normalized Seurat objects
+normalize_seurat_list <- function(seurat_list, apply_filter = TRUE) {
+  
+  # Apply filtering if requested
+  if (apply_filter) {
+    seurat_list <- pbapply::pblapply(X = seurat_list, FUN = function(obj) {
+      obj <- getMitoContent(obj)
+      obj <- obj[, obj@meta.data$percent.mt < 10]
+      obj <- obj[, obj@meta.data$nFeature_RNA < 9000]
+      obj <- obj[, obj@meta.data$nFeature_RNA > 200]
+      return(obj)
+    })
+    
+    # Remove samples with too few cells
+    seurat_list <- seurat_list[unlist(lapply(seurat_list, ncol)) > 50]
+  }
+  
+  # Apply SCTransform normalization
+  seurat_list <- pbapply::pblapply(X = seurat_list, FUN = function(obj) {
+    vars_to_regress <- "percent.mt"
+    
+    obj <- tryCatch({
+      SCTransform(obj, method = "glmGamPoi", verbose = FALSE, 
+                 vst.flavor = "v2", vars.to.regress = vars_to_regress, 
+                 variable.features.n = 2000)
+    }, error = function(e) {
+      SCTransform(obj, method = "glmGamPoi", verbose = FALSE, 
+                 vars.to.regress = vars_to_regress, 
+                 variable.features.n = 2000)
+    }, silent = TRUE)
+    
+    return(obj)
+  })
+  
+  return(seurat_list)
+}
+```
+
+```{r dataset_01_kim_2020}
+# ============================================================================
+# Dataset 1: Kim 2020 (GSE131907) - Lung cancer brain metastases
+# ============================================================================
+
+reprocess_kim <- FALSE
+kim_dir <- "Kim_2020_GSE131907/"
+
+if (reprocess_kim) {
+  
+  # Load metadata and expression matrix
+  metadata <- read.delim(paste0(data_dir, kim_dir, "GSE131907_Lung_Cancer_cell_annotation.txt"), 
+                        header = TRUE)
+  rownames(metadata) <- metadata$Index
+  
+  expression_matrix <- readRDS(paste0(data_dir, kim_dir, "GSE131907_Lung_Cancer_raw_UMI_matrix.rds"))
+  
+  # Create Seurat object
+  so_kim <- CreateSeuratObject(expression_matrix, meta.data = metadata)
+  
+  # Filter for malignant cells only
+  so_kim <- so_kim[, so_kim@meta.data[["Cell_subtype"]] %in% "Malignant cells"]
+  
+  # Add study metadata
+  so_kim@meta.data$study <- "Kim_2020"
+  so_kim@meta.data$sample <- so_kim@meta.data$Sample
+  so_kim@meta.data$primary.tumor <- "LUAD"
+  
+  # Classify tumor sites
+  so_kim@meta.data$tumor.site <- "other"
+  so_kim@meta.data$tumor.site[so_kim@meta.data$Sample_Origin %in% "mBrain"] <- "mBrain"
+  so_kim@meta.data$tumor.site[so_kim@meta.data$Sample_Origin %in% "mLN"] <- "mLN"
+  so_kim@meta.data$tumor.site[so_kim@meta.data$Sample_Origin %in% "tL/B"] <- "primary"
+  
+  # Standard preprocessing pipeline
+  so_kim <- filter_sc_data(so_kim)
+  so_kim <- NormalizeData(so_kim)
+  so_kim <- ScaleData(so_kim)
+  so_kim <- FindVariableFeatures(so_kim)
+  so_kim <- RunPCA(so_kim, features = VariableFeatures(so_kim))
+  so_kim <- RunUMAP(so_kim, dims = 1:50)
+  so_kim <- FindNeighbors(so_kim, dims = 1:50)
+  so_kim <- FindClusters(so_kim, resolution = 1)
+  
+  # Visualize results
+  cluster.UMAP(so_kim, "tumor.site")
+  cluster.UMAP(so_kim)
+  
+  # Split by sample and normalize
+  so_kim <- Seurat::SplitObject(object = so_kim, split.by = "sample")
+  so_kim <- so_kim[unlist(lapply(so_kim, ncol)) > 50]
+  so_kim <- normalize_seurat_list(so_kim)
+  
+  # Save processed data
+  saveRDS(so_kim, paste0(data_dir, kim_dir, "seurat_object_BM_kim.rds"))
+  
+} else {
+  so_kim <- readRDS(paste0(data_dir, kim_dir, "seurat_object_BM_kim.rds"))
+}
+```
+
+```{r dataset_02_biermann_2022}
+# ============================================================================
+# Dataset 2: Biermann 2022 (GSE185386) - Melanoma brain metastases
+# ============================================================================
+
+reprocess_biermann <- FALSE
+biermann_dir <- "Biermann_2022_GSE185386/sn/"
+
+if (reprocess_biermann) {
+  
+  # Get file list and extract sample IDs
+  biermann_files <- list.files(paste0(data_dir, biermann_dir))
+  biermann_files <- biermann_files[grepl("GSM", biermann_files)]
+  biermann_ids <- unique(stringr::str_extract(biermann_files, "[A-Z0-9]*_"))
+  
+  # Process each sample
+  seurat_list <- list()
+  for (i in 1:length(biermann_ids)) {
+    
+    current_id <- biermann_ids[i]
+    miko_message(current_id)
+    
+    # Find files for current sample
+    current_files <- biermann_files[grepl(current_id, biermann_files)]
+    matrix_file <- current_files[grepl("matrix", current_files)]
+    features_file <- current_files[grepl("feature", current_files)]
+    barcodes_file <- current_files[grepl("barcode", current_files)]
+    
+    # Read data files
+    features <- read.delim(paste0(data_dir, biermann_dir, features_file), header = FALSE)
+    barcodes <- read.delim(paste0(data_dir, biermann_dir, barcodes_file), header = FALSE)
+    
+    expression_matrix <- Matrix::readMM(paste0(data_dir, biermann_dir, matrix_file))
+    colnames(expression_matrix) <- barcodes$V1
+    rownames(expression_matrix) <- features$V2
+    
+    # Extract donor ID
+    donor_id <- stringr::str_extract(stringr::str_remove(features_file, current_id), "[A-Z0-9]*")
+    
+    # Create Seurat object
+    seurat_list[[donor_id]] <- CreateSeuratObject(expression_matrix)
+    seurat_list[[donor_id]]$donor <- donor_id
+    seurat_list[[donor_id]]$type <- NA
+  }
+  
+  # Merge all samples
+  so_biermann <- merge(seurat_list[[1]], y = seurat_list[-1])
+  
+  # Add study metadata
+  so_biermann@meta.data$study <- "Biermann_2022"
+  so_biermann@meta.data$sample <- so_biermann@meta.data$donor
+  so_biermann@meta.data$type <- "BM"
+  so_biermann@meta.data$primary.tumor <- "SKCM"
+  
+  # Classify tumor sites
+  so_biermann@meta.data$tumor.site <- "other"
+  so_biermann@meta.data$tumor.site[grepl("MBM", so_biermann@meta.data$sample)] <- "mBrain"
+  so_biermann@meta.data$tumor.site[grepl("MPM", so_biermann@meta.data$sample)] <- "mPeripheral"
+  
+  # Standard preprocessing
+  so_biermann <- filter_sc_data(so_biermann)
+  so_biermann <- NormalizeData(so_biermann)
+  so_biermann <- ScaleData(so_biermann)
+  so_biermann <- FindVariableFeatures(so_biermann)
+  so_biermann <- RunPCA(so_biermann, features = VariableFeatures(so_biermann))
+  so_biermann <- RunUMAP(so_biermann, dims = 1:50)
+  so_biermann <- FindNeighbors(so_biermann, dims = 1:50)
+  so_biermann <- FindClusters(so_biermann, resolution = 1)
+  
+  # Batch correction with BBKNN
+  so_biermann <- runBBKNN(object = so_biermann, batch = "sample")
+  so_biermann <- FindClusters(so_biermann, resolution = 1, graph.name = "bbknn")
+  
+  # Visualizations
+  cluster.UMAP(so_biermann, "sample", reduction = "b")
+  cluster.UMAP(so_biermann, "tumor.site", reduction = "b")
+  cluster.UMAP(so_biermann, reduction = "b")
+  
+  # Load cell type gene signatures
+  ct_myeloid <- wideDF2namedList(readxl::read_xlsx(paste0(data_dir, "Biermann_2022_GSE185386/Table_S1.xlsx"), sheet = "Myeloid"))
+  ct_tcell <- wideDF2namedList(readxl::read_xlsx(paste0(data_dir, "Biermann_2022_GSE185386/Table_S1.xlsx"), sheet = "T cells"))
+  ct_cns <- wideDF2namedList(readxl::read_xlsx(paste0(data_dir, "Biermann_2022_GSE185386/Table_S1.xlsx"), sheet = "CNS cells"))
+  ct_tumor <- wideDF2namedList(readxl::read_xlsx(paste0(data_dir, "Biermann_2022_GSE185386/Table_S1.xlsx"), sheet = "Melanoma"))
+  
+  cell_type_signatures <- c(ct_myeloid, ct_tcell, ct_cns, ct_tumor)
+  
+  # Cell type prediction using gene signatures
+  ms_results <- runMS(object = so_biermann, genelist = cell_type_signatures, 
+                     raster = TRUE, scale = FALSE, reduction = "b")
+  cluster.UMAP(so_biermann, reduction = "b")
+  ms_results$plot.list
+  ms_results$plot.max.score
+  
+  # Identify tumor cells
+  so_biermann@meta.data$cell_type <- so_biermann$seurat_clusters
+  so_biermann@meta.data$predicted.class <- ms_results$class.prediction
+  
+  tumor_clusters <- c(0, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 18)
+  tumor_signatures <- c("AXL_sig", "MITF_sig", "MBM_top100", "MPM_top100")
+  
+  so_biermann@meta.data$is.tumor <- (so_biermann$predicted.class %in% tumor_signatures & 
+                                    so_biermann$seurat_clusters %in% tumor_clusters)
+  
+  cluster.UMAP(so_biermann, reduction = "b", group.by = "is.tumor")
+  
+  # Filter for tumor cells only
+  so_biermann <- so_biermann[, so_biermann@meta.data$is.tumor]
+  
+  # Split by sample and normalize
+  seurat_list <- Seurat::SplitObject(object = so_biermann, split.by = "sample")
+  seurat_list <- seurat_list[unlist(lapply(seurat_list, ncol)) > 50]
+  seurat_list <- normalize_seurat_list(seurat_list)
+  
+  # Save processed data
+  so_biermann <- seurat_list
+  saveRDS(so_biermann, paste0(data_dir, biermann_dir, "seurat_object_tumor_biermann.rds"))
+  
+} else {
+  so_biermann <- readRDS(paste0(data_dir, biermann_dir, "seurat_object_tumor_biermann.rds"))
+}
+```
+
+```{r dataset_03_gonzalez_2022}
+# ============================================================================
+# Dataset 3: Gonzalez 2022 (GSE186344) - Mixed cancer brain metastases
+# ============================================================================
+
+reprocess_gonzalez <- FALSE
+gonzalez_dir <- "Gonzalez_2022_GSE186344/GSE186344_RAW/"
+
+if (reprocess_gonzalez) {
+  
+  # Get file list (exclude mouse samples)
+  gonzalez_files <- list.files(paste0(data_dir, gonzalez_dir))
+  gonzalez_files <- gonzalez_files[grepl("GSM", gonzalez_files)]
+  gonzalez_files <- gonzalez_files[!grepl("Mouse", gonzalez_files)]
+  gonzalez_ids <- unique(stringr::str_extract(gonzalez_files, "[A-Z0-9]*_"))
+  
+  # Process each sample
+  seurat_list <- list()
+  for (i in 1:length(gonzalez_ids)) {
+    
+    current_id <- gonzalez_ids[i]
+    miko_message(current_id)
+    
+    # Find files for current sample
+    current_files <- gonzalez_files[grepl(current_id, gonzalez_files)]
+    matrix_file <- current_files[grepl("matrix", current_files)]
+    features_file <- current_files[grepl("feature", current_files)]
+    barcodes_file <- current_files[grepl("barcode", current_files)]
+    
+    # Try to load annotation file if available
+    annotation_data <- NA
+    try({
+      annotation_file <- current_files[grepl("annotation", tolower(current_files))]
+      annotation_data <- read.csv(paste0(data_dir, gonzalez_dir, annotation_file), header = TRUE)
+    })
+    
+    # Read expression data
+    features <- read.delim(paste0(data_dir, gonzalez_dir, features_file), header = FALSE)
+    barcodes <- read.delim(paste0(data_dir, gonzalez_dir, barcodes_file), header = FALSE)
+    
+    expression_matrix <- Matrix::readMM(paste0(data_dir, gonzalez_dir, matrix_file))
+    colnames(expression_matrix) <- barcodes$V1
+    rownames(expression_matrix) <- features$V2
+    
+    # Extract donor ID
+    donor_id <- stringr::str_remove(stringr::str_remove(features_file, current_id), "_features.tsv.gz")
+    
+    # Create Seurat object
+    seurat_list[[donor_id]] <- CreateSeuratObject(expression_matrix)
+    seurat_list[[donor_id]]$donor <- donor_id
+    seurat_list[[donor_id]]$type <- NA
+    seurat_list[[donor_id]]@misc[["annotation"]] <- annotation_data
+  }
+  
+  # Add annotations where available
+  for (i in 1:length(seurat_list)) {
+    sample_name <- names(seurat_list)[i]
+    seurat_obj <- seurat_list[[sample_name]]
+    
+    try({
+      if (is.data.frame(seurat_obj@misc[["annotation"]])) {
+        annotation_df <- seurat_obj@misc[["annotation"]]
+        annotation_df$barcode <- gsub("_", "", stringr::str_extract(annotation_df$X, "_[A-Z]*"))
+        
+        barcode_to_annotation <- annotation_df$Cell_Type
+        names(barcode_to_annotation) <- annotation_df$barcode
+        
+        meta_df <- seurat_obj@meta.data
+        meta_df$barcode <- stringr::str_extract(rownames(meta_df), "[A-Z]*")
+        meta_df$annotation <- barcode_to_annotation[meta_df$barcode]
+        seurat_obj@meta.data <- meta_df
+        seurat_list[[sample_name]] <- seurat_obj
+      }
+    })
+  }
+  
+  # Merge all samples
+  so_gonzalez <- merge(seurat_list[[1]], y = seurat_list[-1])
+  
+  # Add study metadata
+  so_gonzalez@meta.data$study <- "Gonzalez_2022"
+  so_gonzalez@meta.data$sample <- so_gonzalez@meta.data$donor
+  so_gonzalez@meta.data$type <- "BM"
+  
+  # Standard preprocessing
+  so_gonzalez <- filter_sc_data(so_gonzalez)
+  so_gonzalez <- NormalizeData(so_gonzalez)
+  so_gonzalez <- ScaleData(so_gonzalez)
+  so_gonzalez <- FindVariableFeatures(so_gonzalez)
+  so_gonzalez <- RunPCA(so_gonzalez, features = VariableFeatures(so_gonzalez))
+  so_gonzalez <- RunUMAP(so_gonzalez, dims = 1:50)
+  so_gonzalez <- FindNeighbors(so_gonzalez, dims = 1:50)
+  so_gonzalez <- FindClusters(so_gonzalez, resolution = 1)
+  
+  # Batch correction
+  so_gonzalez <- runBBKNN(object = so_gonzalez, batch = "sample")
+  so_gonzalez <- FindClusters(so_gonzalez, resolution = 1, graph.name = "bbknn")
+  
+  # Visualizations
+  cluster.UMAP(so_gonzalez, "sample", reduction = "b")
+  cluster.UMAP(so_gonzalez, reduction = "b")
+  cluster.UMAP(so_gonzalez, "annotation", reduction = "b")
+  
+  # Expression-based tumor identification
+  marker_genes <- c("MLANA", "CLDN5", "KRT19", "EPCAM", "TAGLN")
+  for (gene in marker_genes) {
+    exprUMAP(so_gonzalez, gene, reduction = "b")
+  }
+  
+  # Identify tumor cells based on annotation and clustering
+  tumor_annotation <- "MTC"
+  tumor_clusters <- c(4, 0, 7, 14, 11, 2)
+  
+  so_gonzalez@meta.data$is.tumor <- (so_gonzalez@meta.data$annotation %in% tumor_annotation | 
+                                    so_gonzalez@meta.data$seurat_clusters %in% tumor_clusters)
+  
+  cluster.UMAP(so_gonzalez, "is.tumor", reduction = "b")
+  
+  # Filter for tumor cells
+  so_gonzalez <- so_gonzalez[, so_gonzalez@meta.data$is.tumor]
+  
+  # Split by sample and normalize
+  seurat_list <- Seurat::SplitObject(object = so_gonzalez, split.by = "sample")
+  seurat_list <- seurat_list[unlist(lapply(seurat_list, ncol)) > 50]
+  seurat_list <- normalize_seurat_list(seurat_list)
+  
+  # Save processed data
+  so_gonzalez <- seurat_list
+  saveRDS(so_gonzalez, paste0(data_dir, gonzalez_dir, "seurat_object_tumor_gonzalez.rds"))
+  
+} else {
+  so_gonzalez <- readRDS(paste0(data_dir, gonzalez_dir, "seurat_object_tumor_gonzalez.rds"))
+}
+```
+
+```{r dataset_04_song_2023}
+# ============================================================================
+# Dataset 4: Song 2023 (GSE234832) - Breast and lung cancer brain metastases
+# ============================================================================
+
+reprocess_song <- FALSE
+song_dir <- "Song_2023_GSE234832/GSE234832_RAW/"
+
+if (reprocess_song) {
+  
+  # Get file list (exclude mouse samples)
+  song_files <- list.files(paste0(data_dir, song_dir))
+  song_files <- song_files[grepl("GSM", song_files)]
+  song_files <- song_files[!grepl("Mouse", song_files)]
+  song_ids <- unique(stringr::str_extract(song_files, "[A-Z0-9]*_"))
+  
+  # Process each sample
+  seurat_list <- list()
+  for (i in 1:length(song_ids)) {
+    
+    current_id <- song_ids[i]
+    miko_message(current_id)
+    
+    # Find files for current sample
+    current_files <- song_files[grepl(current_id, song_files)]
+    matrix_file <- current_files[grepl("matrix", current_files)]
+    features_file <- current_files[grepl("feature", current_files)]
+    barcodes_file <- current_files[grepl("barcode", current_files)]
+    
+    # Read data files
+    features <- read.delim(paste0(data_dir, song_dir, features_file), header = FALSE)
+    barcodes <- read.delim(paste0(data_dir, song_dir, barcodes_file), header = FALSE)
+    
+    expression_matrix <- Matrix::readMM(paste0(data_dir, song_dir, matrix_file))
+    colnames(expression_matrix) <- barcodes$V1
+    rownames(expression_matrix) <- features$V2
+    
+    # Extract donor ID
+    donor_id <- stringr::str_remove(stringr::str_remove(features_file, current_id), ".features.tsv.gz")
+    
+    # Create Seurat object
+    seurat_list[[donor_id]] <- CreateSeuratObject(expression_matrix)
+    seurat_list[[donor_id]]$donor <- donor_id
+    seurat_list[[donor_id]]$type <- NA
+  }
+  
+  # Merge all samples
+  so_song <- merge(seurat_list[[1]], y = seurat_list[-1])
+  
+  # Add study metadata
+  so_song@meta.data$study <- "Song_2023"
+  so_song@meta.data$sample <- so_song@meta.data$donor
+  so_song@meta.data$type <- "BM"
+  
+  # Classify primary tumor type based on sample name
+  so_song@meta.data$primary.tumor <- NA
+  so_song@meta.data$primary.tumor[grepl("BRBMET", so_song@meta.data$donor)] <- "Breast"
+  so_song@meta.data$primary.tumor[grepl("LUBMET", so_song@meta.data$donor)] <- "Lung"
+  so_song@meta.data$tumor.site <- "mBrain"
+  
+  # Standard preprocessing
+  so_song <- filter_sc_data(so_song)
+  so_song <- NormalizeData(so_song)
+  so_song <- ScaleData(so_song)
+  so_song <- FindVariableFeatures(so_song)
+  so_song <- RunPCA(so_song, features = VariableFeatures(so_song))
+  so_song <- RunUMAP(so_song, dims = 1:50)
+  so_song <- FindNeighbors(so_song, dims = 1:50)
+  so_song <- FindClusters(so_song, resolution = 1)
+  
+  # Batch correction
+  so_song <- runBBKNN(object = so_song, batch = "sample")
+  so_song <- FindClusters(so_song, resolution = 1, graph.name = "bbknn")
+  
+  # Visualizations
+  cluster.UMAP(so_song, "sample", reduction = "b")
+  cluster.UMAP(so_song, "tumor.site", reduction = "b")
+  cluster.UMAP(so_song, reduction = "b")
+  
+  # Expression analysis for cell type identification
+  marker_genes <- c("MLANA", "CLDN5", "KRT19", "LYZ", "EPCAM", "CD3E", 
+                   "RGS5", "JCHAIN", "TAGLN", "GFAP", "TK1")
+  for (gene in marker_genes) {
+    exprUMAP(so_song, gene, reduction = "b")
+  }
+  
+  # Define cell type gene signatures
+  cell_type_signatures <- list(
+    tumor = c("KRT19", "KRT8", "KRT18", "SFN", "EPCAM"),
+    myeloid = c("MRC1", "CD163", "TREM2", "MSR1"),
+    tcell = c("CD3D", "CD3G", "CD28", "LCK", "TRAT1", "BCL11B", "CD2", "TRBC1", "TRAC", "CD3E", "SKAP1", "AURKB"),
+    nsc = c("AURKB", "CDCA3", "CKAP2", "UBE2C", "CDCA2", "HMMR", "TK1"),
+    oligo = c("GJB1", "GALST1", "GJC2"),
+    fibroblast = c("COL1A1", "COL1A2", "IGFBP2"),
+    endothelial = c("VWF", "CLDN5", "CDH5", "ESAM")
+  )
+  
+  # Cell type prediction
+  ms_results <- runMS(object = so_song, genelist = cell_type_signatures, 
+                     raster = FALSE, scale = FALSE, reduction = "b")
+  cluster.UMAP(so_song, reduction = "b")
+  ms_results$plot.list
+  ms_results$plot.max.score
+  
+  # Identify tumor cells
+  tumor_clusters <- c(0, 2, 4, 12)
+  so_song@meta.data$is.tumor <- so_song@meta.data$seurat_clusters %in% tumor_clusters
+  
+  cluster.UMAP(so_song, "is.tumor", reduction = "b")
+  
+  # Filter for tumor cells
+  so_song <- so_song[, so_song@meta.data$is.tumor]
+  
+  # Split by sample and normalize
+  seurat_list <- Seurat::SplitObject(object = so_song, split.by = "sample")
+  seurat_list <- seurat_list[unlist(lapply(seurat_list, ncol)) > 50]
+  seurat_list <- normalize_seurat_list(seurat_list)
+  
+  # Save processed data
+  so_song <- seurat_list
+  saveRDS(so_song, paste0(data_dir, song_dir, "seurat_object_tumor_song.rds"))
+  
+} else {
+  so_song <- readRDS(paste0(data_dir, song_dir, "seurat_object_tumor_song.rds"))
+}
+```
+
+```{r summary_and_timing}
+# Calculate total processing time
+end.time <- proc.time()
+total.time <- end.time - start.time
+
+cat("Brain metastasis dataset consolidation and preprocessing completed.\n")
+cat("Total processing time:", round(total.time[3]/60, 2), "minutes\n")
+
+# Summary of processed datasets
+cat("\nProcessed datasets:\n")
+cat("1. Kim 2020 (GSE131907): Lung cancer brain metastases\n")
+cat("2. Biermann 2022 (GSE185386): Melanoma brain metastases\n") 
+cat("3. Gonzalez 2022 (GSE186344): Mixed cancer brain metastases\n")
+cat("4. Song 2023 (GSE234832): Breast and lung cancer brain metastases\n")
+```
