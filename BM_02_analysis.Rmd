@@ -1,0 +1,982 @@
+---
+title: "Brain Metastasis scRNA-seq Gene Expression Analysis"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+# Clear global environment
+rm(list = setdiff(ls(), c("data.path", "user")))
+invisible({gc()})
+
+# Initiate timer
+start.time <- proc.time()
+
+# List of packages to load
+packages2load <- c("Seurat", "sctransform", "Libra",
+                   "dplyr", "tidyr", "RColorBrewer", "ggplot2", "gridExtra", 
+                   "DT", "flexdashboard", "future", "biomaRt", "foreach", 
+                   "parallel", "doParallel", "scMiko", "reshape2", "glmGamPoi",
+                   "ggrepel", "cowplot", "pbapply")
+
+# Load packages
+invisible({lapply(packages2load, library, character.only = TRUE)})
+```
+
+```{r configuration}
+# Set main directory path
+dir <- "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/BrainMet/data/"
+
+# Analysis parameters
+# GENES_OF_INTEREST <- c("DHODH", "NAMPT",  "GSDME", "GDF15")
+GENES_OF_INTEREST <- c("DHODH", "GSDME")
+PRIMARY_TUMORS_TO_ANALYZE <- c("Breast", "Lung", "Melanoma")
+FDR_THRESHOLD <- 0.2
+CDI_THRESHOLD <- 0
+MIN_SAMPLE_FILTER <- 2
+```
+
+```{r helper-functions}
+#' Filter Seurat object by quality metrics
+#' @param x Seurat object
+#' @return Filtered Seurat object
+filterData <- function(x) {
+  x <- getMitoContent(x)
+  x <- x[, x@meta.data$percent.mt < 10]
+  x <- x[, x@meta.data$nFeature_RNA < 9000]
+  x <- x[, x@meta.data$nFeature_RNA > 200]
+  return(x)
+}
+
+#' Normalize data using SCTransform
+#' @param so.list List of Seurat objects
+#' @param do.filter Whether to filter cells
+#' @param do.filter.only Only filter without normalization
+#' @return List of normalized Seurat objects
+normData <- function(so.list, do.filter = TRUE, do.filter.only = FALSE) {
+  if (do.filter) {
+    so.list <- pbapply::pblapply(X = so.list, FUN = function(x) {
+      x <- getMitoContent(x)
+      x <- x[, x@meta.data$percent.mt < 10]
+      x <- x[, x@meta.data$nFeature_RNA < 9000]
+      x <- x[, x@meta.data$nFeature_RNA > 200]
+      return(x)
+    })
+    
+    # Remove samples with fewer than 50 cells
+    so.list <- so.list[unlist(lapply(so.list, ncol)) > 50]
+  }
+  
+  if (!do.filter.only) {
+    so.list <- pbapply::pblapply(X = so.list, FUN = function(x) {
+      var2reg <- "percent.mt"
+      object <- x
+      object <- tryCatch({
+        SCTransform(object, method = "glmGamPoi", verbose = FALSE, 
+                    vst.flavor = "v2", vars.to.regress = var2reg, 
+                    variable.features.n = 2000)
+      }, error = function(e) {
+        object <- SCTransform(object, method = "glmGamPoi", verbose = FALSE, 
+                              vars.to.regress = var2reg, 
+                              variable.features.n = 2000)  
+        return(object)
+      }, silent = TRUE)
+    })
+  }
+  
+  return(so.list)
+}
+
+#' Show unique tumor sites from list of Seurat objects
+show_tumor.sites <- function(object) {
+  unique(unlist(lapply(object, function(x) {
+    unique(x@meta.data[["tumor.site"]])
+  })))
+}
+
+#' Show unique primary tumors from list of Seurat objects
+show_primary.tumor <- function(object) {
+  unique(unlist(lapply(object, function(x) {
+    unique(x@meta.data[["primary.tumor"]])
+  })))
+}
+
+#' Rename samples with systematic naming convention
+rename_samples <- function(object) {
+  pt <- lapply(object, function(x) {unique(x@meta.data$primary.tumor)})
+  ts <- lapply(object, function(x) {unique(x@meta.data$tumor.site)})
+  study <- unlist(lapply(object, function(x) {unique(x@meta.data$study)}))  
+  study <- gsub("_", "", study)
+  new_names <- paste0(pt, "-", ts, "-", seq(1, length(pt)), "_", study)
+  return(new_names)
+}
+
+#' Create cell to sample name mapping
+c2n <- function(object) {
+  name.list <- lapply(object, colnames)
+  df.c2n <- namedList2longDF(name.list)
+  c2n.mapping <- df.c2n$name
+  names(c2n.mapping) <- df.c2n$value
+  return(c2n.mapping)
+}
+```
+
+```{r load-data}
+# Load all datasets
+message("Loading scRNA-seq datasets...")
+
+# Biermann et al. 2022
+current.dir <- "Biermann_2022_GSE185386/"
+so.biermann <- readRDS(paste0(dir, current.dir, "seurat_object_tumor_biermann.rds"))
+
+# Gonzalez et al. 2022
+current.dir <- "Gonzalez_2022_GSE186344/"
+so.gonzalez <- readRDS(paste0(dir, current.dir, "seurat_object_tumor_gonzalez.rds"))
+
+# Kim et al. 2020
+current.dir <- "Kim_2020_GSE131907/"
+so.kim <- readRDS(paste0(dir, current.dir, "seurat_object_BM_kim.rds"))
+
+# Song et al. 2023
+current.dir <- "Song_2023_GSE234832/"
+so.song <- readRDS(paste0(dir, current.dir, "seurat_object_tumor_song.rds"))
+
+message("Data loaded successfully!")
+```
+
+```{r harmonize-metadata}
+# Harmonize tumor site annotations
+message("Harmonizing metadata across datasets...")
+
+# Check current annotations
+cat("Current tumor sites:\n")
+cat("Biermann:", show_tumor.sites(so.biermann), "\n")
+cat("Gonzalez:", show_tumor.sites(so.gonzalez), "\n")
+cat("Kim:", show_tumor.sites(so.kim), "\n")
+cat("Song:", show_tumor.sites(so.song), "\n")
+
+# Set all brain metastases to "mBrain"
+so.gonzalez <- lapply(so.gonzalez, function(x) {
+  x@meta.data$tumor.site <- "mBrain"
+  return(x)
+})
+
+# Harmonize primary tumor annotations
+so.kim <- lapply(so.kim, function(x) {
+  x@meta.data$primary.tumor <- "Lung"
+  return(x)
+})
+
+so.biermann <- lapply(so.biermann, function(x) {
+  x@meta.data$primary.tumor <- "Melanoma"
+  return(x)
+})
+
+# Annotate Gonzalez samples based on sample names
+for (i in 1:length(so.gonzalez)) {
+  sname <- names(so.gonzalez)[i]
+  object <- so.gonzalez[[sname]]
+  
+  if (grepl("Melan", sname)) {
+    object@meta.data$primary.tumor <- "Melanoma"
+  } else if (grepl("Breast", sname)) {
+    object@meta.data$primary.tumor <- "Breast" 
+  } else if (grepl("Lung", sname)) {
+    object@meta.data$primary.tumor <- "Lung"
+  } else if (grepl("Ovarian", sname)) {
+    object@meta.data$primary.tumor <- "Ovarian"
+  } else if (grepl("Renal", sname)) {
+    object@meta.data$primary.tumor <- "RCC"
+  } else if (grepl("Unknown", sname)) {
+    object@meta.data$primary.tumor <- "Other"
+  } else if (grepl("Rhabdomyo", sname)) {
+    object@meta.data$primary.tumor <- "Rhabdomyosarcoma"
+  }
+  
+  so.gonzalez[[sname]] <- object
+}
+
+# Rename samples systematically
+names(so.biermann) <- rename_samples(so.biermann)
+names(so.gonzalez) <- rename_samples(so.gonzalez)
+names(so.kim) <- rename_samples(so.kim)
+names(so.song) <- rename_samples(so.song)
+
+# Create cell to sample mapping
+names.so.biermann <- c2n(so.biermann)
+names.so.gonzalez <- c2n(so.gonzalez)
+names.so.kim <- c2n(so.kim)
+names.so.song <- c2n(so.song)
+
+c2n.mapping <- c(names.so.biermann, names.so.gonzalez, names.so.kim, names.so.song)
+
+
+
+# Save mapping
+# saveRDS(c2n.mapping, "sample2cell_BrM_mapping.rds")
+```
+
+```{r integrate-data, eval=TRUE}
+# Integration workflow
+do.integration <- FALSE
+
+if (do.integration) {
+  message("Starting data integration...")
+  
+  # Combine all datasets
+  so.query <- c(so.biermann, so.gonzalez, so.kim, so.song)
+  rm(so.biermann, so.gonzalez, so.kim, so.song)
+  gc()
+  
+  # Merge Seurat objects
+  so.merge <- merge(so.query[[1]], y = so.query[-1])
+  rm(so.query)
+  gc()
+  
+  # Update and normalize
+  so.merge <- UpdateSeuratObject(so.merge)
+  DefaultAssay(so.merge) <- "RNA"
+  so.merge <- NormalizeData(so.merge)
+  so.merge <- FindVariableFeatures(so.merge)
+  so.merge <- ScaleData(so.merge, block.size = 1000)
+  so.merge <- RunPCA(so.merge, features = VariableFeatures(so.merge))
+  
+  # Batch correction with BBKNN
+  so.merge <- runBBKNN(so.merge, batch = "sample")
+  cluster.UMAP(so.merge, reduction = "b")
+  so.merge <- FindClusters(so.merge, graph.name = "bbknn", resolution = 1)
+  
+  # SCTransform normalization
+  message("Running SCTransform normalization...")
+  var2reg <- c("percent.mt")
+  so.merge <- SCTransform(so.merge, method = "glmGamPoi", verbose = TRUE, 
+                          vst.flavor = "v2", conserve.memory = TRUE,
+                          vars.to.regress = var2reg, variable.features.n = 3000)
+  gc()
+  
+  # Final dimensionality reduction
+  message("Running final UMAP...")
+  DefaultAssay(so.merge) <- "SCT"
+  so.merge <- RunPCA(so.merge, features = VariableFeatures(so.merge))
+  so.merge <- runBBKNN(so.merge, batch = "sample")
+  cluster.UMAP(so.merge, reduction = "b")
+  so.merge <- FindClusters(so.merge, graph.name = "bbknn", resolution = c(0.5, 1))
+  
+  # Save integrated object
+  # saveRDS(object = so.merge, file = "seurat_all_BrM_tumors_integrated.rds")
+  
+} else {
+  # Load pre-integrated data
+  so.merge <- readRDS("seurat_all_BrM_tumors_090524.rds")
+}
+
+# add missing data label
+so.merge@meta.data[["primary.tumor"]][is.na(so.merge@meta.data[["primary.tumor"]])] <- "CRC"
+```
+
+```{r cell-count-summary, fig.width=12, fig.height=8}
+#' Create summary dot plot of cell counts per study and tumor type
+#' @param seurat_obj Seurat object with integrated data
+#' @return ggplot object with dot plot visualization
+create_cell_count_summary <- function(seurat_obj) {
+  
+  # Extract metadata
+  metadata <- seurat_obj@meta.data
+  
+  # Create summary table of cell counts
+  cell_counts <- metadata %>%
+    dplyr::group_by(study, primary.tumor, tumor.site) %>%
+    dplyr::summarise(
+      n_cells = n(),
+      n_samples = n_distinct(sample),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(study, primary.tumor)
+  
+  # Create a more detailed summary including sample information
+  sample_summary <- metadata %>%
+    dplyr::group_by(study, primary.tumor, tumor.site, sample) %>%
+    dplyr::summarise(n_cells = n(), .groups = "drop") %>%
+    dplyr::group_by(study, primary.tumor, tumor.site) %>%
+    dplyr::summarise(
+      total_cells = sum(n_cells),
+      n_samples = n(),
+      mean_cells_per_sample = round(mean(n_cells), 1),
+      median_cells_per_sample = round(median(n_cells), 1),
+      .groups = "drop"
+    )
+  
+  # Print summary table
+  cat("Cell Count Summary by Study and Tumor Type:\n")
+  cat("==========================================\n")
+  print(knitr::kable(sample_summary, format = "simple"))
+  
+  # Create dot plot
+  p1 <- cell_counts %>%
+    ggplot(aes(x = primary.tumor, y = study)) +
+    geom_point(aes(size = n_cells, color = tumor.site), alpha = 0.7) +
+    scale_size_continuous(
+      name = "Cell Count",
+      range = c(2, 15),
+      breaks = c(100, 500, 1000, 2000, 5000),
+      labels = c("100", "500", "1K", "2K", "5K")
+    ) +
+    scale_color_brewer(
+      name = "Tumor Site",
+      type = "qual",
+      palette = "Set2"
+    ) +
+    labs(
+      title = "Cell Count Distribution Across Studies and Tumor Types",
+      subtitle = "Dot size represents number of cells, color represents tumor site",
+      x = "Primary Tumor Type",
+      y = "Study"
+    ) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+      axis.text.y = element_text(size = 11),
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 12),
+      legend.position = "right",
+      panel.grid.minor = element_blank()
+    ) +
+    guides(
+      size = guide_legend(override.aes = list(alpha = 1)),
+      color = guide_legend(override.aes = list(size = 5, alpha = 1))
+    )
+  
+  # Create complementary bar plot showing total cells per study
+  p2 <- metadata %>%
+    dplyr::group_by(study) %>%
+    dplyr::summarise(total_cells = n(), .groups = "drop") %>%
+    ggplot(aes(x = reorder(study, total_cells), y = total_cells)) +
+    geom_col(fill = "steelblue", alpha = 0.7) +
+    geom_text(aes(label = scales::comma(total_cells)), 
+              hjust = -0.1, size = 3.5) +
+    coord_flip() +
+    labs(
+      title = "Total Cells per Study",
+      x = "Study",
+      y = "Number of Cells"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(size = 12, face = "bold"),
+      axis.text = element_text(size = 10)
+    ) +
+    scale_y_continuous(labels = scales::comma_format())
+  
+  # Create sample count plot
+  p3 <- sample_summary %>%
+    ggplot(aes(x = primary.tumor, y = study)) +
+    geom_point(aes(size = n_samples), color = "darkgreen", alpha = 0.7) +
+    geom_text(aes(label = n_samples), size = 3, color = "white", fontface = "bold") +
+    scale_size_continuous(
+      name = "Sample Count",
+      range = c(3, 12)
+    ) +
+    labs(
+      title = "Sample Count Distribution",
+      subtitle = "Number of samples per study and tumor type",
+      x = "Primary Tumor Type",
+      y = "Study"
+    ) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+      axis.text.y = element_text(size = 11),
+      plot.title = element_text(size = 12, face = "bold"),
+      plot.subtitle = element_text(size = 10),
+      legend.position = "right",
+      panel.grid.minor = element_blank()
+    )
+  
+  # Combine plots
+  combined_plot <- cowplot::plot_grid(
+    p1, 
+    cowplot::plot_grid(p2, p3, ncol = 1, rel_heights = c(1, 1)),
+    ncol = 2, 
+    rel_widths = c(2, 1),
+    labels = c("A", "B"),
+    label_size = 14
+  )
+  
+  return(list(
+    main_plot = p1,
+    study_summary = p2,
+    sample_count = p3,
+    combined_plot = combined_plot,
+    summary_table = sample_summary
+  ))
+}
+
+# Generate the cell count summary plots
+message("Creating cell count summary visualizations...")
+
+cell_summary_plots <- create_cell_count_summary(so.merge)
+
+# Display the combined plot
+print(cell_summary_plots$combined_plot)
+
+# SAVE RESULTS
+# savePDF("cell_count_summary_v1_240625.pdf", cell_summary_plots$combined_plot, fig.width=12, fig.height=8)
+
+# Save the summary table
+# write.csv(cell_summary_plots$summary_table, 
+#           "results/cell_count_summary_table.csv", 
+#           row.names = FALSE)
+
+# Create an additional heatmap visualization
+p_heatmap <- cell_summary_plots$summary_table %>%
+  ggplot(aes(x = primary.tumor, y = study, fill = total_cells)) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = paste0(scales::comma(total_cells), "\n(", n_samples, " samples)")), 
+            size = 3, color = "white", fontface = "bold") +
+  scale_fill_gradient(
+    name = "Cell Count",
+    low = "lightblue",
+    high = "darkblue",
+    labels = scales::comma_format()
+  ) +
+  labs(
+    title = "Cell Count Heatmap by Study and Tumor Type",
+    subtitle = "Numbers show total cells and sample count per combination",
+    x = "Primary Tumor Type",
+    y = "Study"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    panel.grid = element_blank()
+  )
+
+print(p_heatmap)
+ # savePDF("cell_count_summary_hm_v2_240625.pdf", p_heatmap, fig.width=12, fig.height=8)
+
+# Print overall summary statistics
+cat("\nOverall Dataset Summary:\n")
+cat("========================\n")
+cat("Total cells:", scales::comma(ncol(so.merge)), "\n")
+cat("Total samples:", length(unique(so.merge$sample)), "\n")
+cat("Total studies:", length(unique(so.merge$study)), "\n")
+cat("Primary tumor types:", length(unique(so.merge$primary.tumor)), "\n")
+cat("Tumor sites:", length(unique(so.merge$tumor.site)), "\n")
+```
+
+```{r gene-expression-analysis, fig.width=10, fig.height=10}
+# Analyze expression of genes of interest
+message("Analyzing gene expression patterns...")
+
+# Create expression plots for all genes of interest
+expr_plots <- list()
+
+for (gene in GENES_OF_INTEREST) {
+  if (gene %in% rownames(so.merge)) {
+    expr_plots[[gene]] <- exprUMAP(so.merge, gene, scale.color = "black", 
+                                    reduction = "b") + 
+                          labs(title = paste0(gene, " Expression"))
+  } else {
+    message(paste0("Gene ", gene, " not found in dataset"))
+  }
+}
+
+# Display expression plots
+if (length(expr_plots) > 0) {
+  cowplot::plot_grid(plotlist = expr_plots, ncol = 2)
+}
+
+# SAVE RESULTS
+# savePDF("gene_expr_UMAP_240625.pdf", expr_plots, fig.width=10, fig.height=10)
+```
+
+```{r metadata-visualization, fig.width=18, fig.height=6}
+# Visualize metadata on UMAP
+p1 <- cluster.UMAP(so.merge, "primary.tumor", reduction = "b") + 
+      labs(title = "Tumor Origin") + theme_void()
+p2 <- cluster.UMAP(so.merge, "tumor.site", reduction = "b") + 
+      labs(title = "Tumor Site") + theme_void()
+p3 <- cluster.UMAP(so.merge, "study", reduction = "b") + 
+      labs(title = "Study") + theme_void()
+
+cowplot::plot_grid(p1, p2, p3, ncol = 3)
+
+# SAVE RESULTS
+# savePDF("gene_expr_groups_240625.pdf", cowplot::plot_grid(p1, p2, p3, ncol = 3), fig.width=18, fig.height=6)
+```
+
+```{r get SCTtransform residuals for genes of interest}
+
+# GET SCTTRANSFORM RESISUALS
+so.merge <- Seurat::GetResidual(so.merge, features = GENES_OF_INTEREST)
+
+```
+
+
+```{r stratified-expression-analysis, fig.width = 12, fig.height=5}
+#' Analyze gene expression stratified by primary tumor type
+#' @param gene Gene name to analyze
+#' @param primary_tumors Vector of primary tumor types to include
+analyze_gene_by_tumor <- function(gene, primary_tumors = PRIMARY_TUMORS_TO_ANALYZE) {
+  
+  if (!gene %in% rownames(so.merge@assays[["SCT"]]@data)) {
+    stop(paste0("Gene ", gene, " not found in dataset"))
+  }
+  
+  # Extract UMAP coordinates and expression data
+  df.umap <- getUMAP(object = so.merge, umap.key = "b")[["df.umap"]]
+  df.umap$expr <- rescaleValues(as.numeric(so.merge@assays[["SCT"]]@scale.data[gene, ])) 
+  
+  # Summarize by sample
+  df.umap.sum <- df.umap %>%
+    dplyr::filter(primary.tumor %in% primary_tumors) %>%
+    dplyr::group_by(study, sample, primary.tumor, tumor.site) %>%
+    dplyr::summarise(mean.expr = mean(expr, na.rm = TRUE), .groups = "drop")
+  
+  # Set factor levels
+  df.umap.sum$tumor.site <- factor(df.umap.sum$tumor.site, 
+                                    levels = c("primary", "mPeripheral", "mLN", "mBrain"))
+  df.umap.sum$primary.tumor <- factor(df.umap.sum$primary.tumor, 
+                                       levels = primary_tumors)
+
+  # Identify outliers using Cook's distance
+lm.res <- lm(mean.expr ~ primary.tumor  + tumor.site, data = df.umap.sum)
+cooksd <- cooks.distance(lm.res)
+outliers <- which(cooksd > 4/nrow(df.umap.sum))
+
+# Refit without outliers
+df.clean <- df.umap.sum[-outliers, ]
+lm.res <- lm(mean.expr ~ primary.tumor  + tumor.site , data = df.clean)
+
+  low.ci <- 0
+  hi.ci <- 1- low.ci
+  # Create plots
+  p1 <- df.umap.sum %>%
+    ggplot(aes(x = primary.tumor, y = mean.expr, fill = tumor.site)) + 
+    geom_boxplot(outlier.shape = NA) +
+    # geom_point() + 
+    coord_cartesian(ylim = quantile(df.umap.sum$mean.expr, c(low.ci, hi.ci), na.rm = TRUE)) + 
+    labs(x = "Tumor Origin", y = paste0(gene, " Expression"),
+         title = paste0(gene, " Expression by Tumor Site")) + 
+    theme_miko(legend = TRUE)
+
+  p2 <- df.umap.sum %>%
+    ggplot(aes(x = primary.tumor, y = mean.expr, fill = study)) + 
+    geom_boxplot(outlier.shape = NA) +  # Remove outlier points from plot
+    # geom_point() + 
+    coord_cartesian(ylim = quantile(df.umap.sum$mean.expr, c(low.ci, hi.ci), na.rm = TRUE)) +  
+    labs(x = "Tumor Origin", y = paste0(gene, " Expression"),
+         title = paste0(gene, " Expression by Study")) + 
+    theme_miko(legend = TRUE)
+  
+  return(list(
+    data = df.umap.sum,
+    model = lm.res,
+    plot_by_site = p1,
+    plot_by_study = p2
+  ))
+}
+
+# Analyze each gene of interest
+gene_analysis_results <- list()
+
+for (gene in GENES_OF_INTEREST) {
+  if (gene %in% rownames(so.merge)) {
+    message(paste0("Analyzing ", gene, "..."))
+    gene_analysis_results[[gene]] <- analyze_gene_by_tumor(gene)
+    
+    # Display plots
+    print(cowplot::plot_grid(
+      gene_analysis_results[[gene]]$plot_by_site,
+      gene_analysis_results[[gene]]$plot_by_study,
+      ncol = 2
+    ))
+    
+    # SAVE RESULTS
+    #  savePDF(paste0(gene, "_gene_boxplot_noLim_240625.pdf"), cowplot::plot_grid(
+    #   gene_analysis_results[[gene]]$plot_by_site,
+    #   gene_analysis_results[[gene]]$plot_by_study,
+    #   ncol = 2
+    # ), fig.width = 12, fig.height=5)
+    
+    # Print model summary
+    cat("\n", gene, "Linear Model Results:\n")
+    print(summary(gene_analysis_results[[gene]]$model))
+    
+  }
+}
+```
+
+```{r codependency-analysis}
+#' Perform codependency analysis for a gene across tumor types
+#' @param gene Gene of interest
+#' @param tumor_type Specific tumor type to analyze (NULL for all)
+analyze_gene_codependency <- function(gene, tumor_type = NULL) {
+  
+  # Get common genes across datasets
+  so.query <- c(so.biermann, so.gonzalez, so.kim, so.song)
+  so.query <- so.query[grepl(paste0(PRIMARY_TUMORS_TO_ANALYZE, collapse = "|"), names(so.query))]
+  
+  all.genes <- c()
+  for (i in 1:length(so.query)) {
+    sname <- names(so.query)[i]
+    all.genes <- c(all.genes, rownames(so.query[[sname]]@assays[["SCT"]]))
+  }
+  
+  df.gene.tally <- data.frame(table(all.genes))
+  df.gene.tally.common <- df.gene.tally %>% dplyr::filter(Freq > 20)
+  gu <- as.character(df.gene.tally.common$all.genes)
+  
+  # Run CDI analysis for each sample
+  cdi.res.list <- list()
+  
+  for (i in 1:length(so.query)) {
+    tryCatch({
+      message(paste0("Processing sample ", i, "/", length(so.query)))
+      sname <- names(so.query)[i]
+      object <- so.query[[sname]]
+      
+      # Filter by tumor type if specified
+      if (!is.null(tumor_type)) {
+        if (unique(object@meta.data$primary.tumor) != tumor_type) {
+          next
+        }
+      }
+      
+      gu.current <- gu[gu %in% rownames(object)]
+      
+      cdi.res.list[[sname]] <- findCDIMarkers(
+        object = object,
+        features.x = gene,
+        features.y = gu.current,
+        geosketch.subset = TRUE
+      )
+      
+      cdi.res.list[[sname]]$sample <- sname
+      cdi.res.list[[sname]]$primary.tumor <- unique(object@meta.data$primary.tumor)
+      cdi.res.list[[sname]]$tumor.site <- unique(object@meta.data$tumor.site)
+      
+    }, error = function(e) {
+      message(paste0("Error in sample ", sname, ": ", e$message))
+    })
+  }
+  
+  # Combine results
+  df.cdi.res <- bind_rows(cdi.res.list)
+  
+  if (!is.null(tumor_type)) {
+    df.cdi.res <- df.cdi.res %>% dplyr::filter(primary.tumor == tumor_type)
+  }
+  
+  # Scale CDI values within samples
+  df.cdi.res <- df.cdi.res %>%
+    dplyr::group_by(sample) %>%
+    dplyr::mutate(scdi = scale(ncdi))
+  
+  # Summarize across samples
+  usample.n <- ulength(df.cdi.res$sample)
+  df.cdi.sum <- df.cdi.res %>% 
+    dplyr::group_by(feature.y) %>%
+    dplyr::summarise(
+      cdi.mean = mean(scdi, na.rm = TRUE),
+      cdi.sd = sd(scdi, na.rm = TRUE),
+      cdi.n = length(scdi),
+      prop.sig = sum(fdr < 0.2)/usample.n,
+      logfdr.mean = mean(-log10(fdr), na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Calculate statistics
+  df.cdi.sum$se <- df.cdi.sum$cdi.sd / sqrt(df.cdi.sum$cdi.n)
+  df.cdi.sum$z <- df.cdi.sum$cdi.mean / df.cdi.sum$se
+  df.cdi.sum$pval <- z2p(df.cdi.sum$z)
+    df.cdi.sum$fdr <- p.adjust(df.cdi.sum$pval, method = "BH")
+  df.cdi.sum$logfdr <- -log10(df.cdi.sum$fdr)
+  
+  # Filter significant genes
+  max.cdi <- max(df.cdi.sum$cdi.n)
+  df.cdi.sig <- df.cdi.sum %>%
+    dplyr::filter(fdr < FDR_THRESHOLD, cdi.n > 0.5 * max.cdi, prop.sig > 0.25 ) 
+  
+  df.cdi.sig2 <-df.cdi.sig %>%
+    dplyr::top_n(30, -fdr)
+  
+  # Create volcano plot
+  plt <- df.cdi.sum %>%
+    dplyr::filter(cdi.n > MIN_SAMPLE_FILTER) %>%
+    ggplot(aes(x = cdi.mean, y = logfdr)) + 
+    geom_hline(yintercept = -log10(FDR_THRESHOLD), linetype = "dashed") + 
+    geom_vline(xintercept = CDI_THRESHOLD, linetype = "dashed") + 
+    geom_point(alpha = 0.05) + 
+    geom_point(data = df.cdi.sig2 , aes(x = cdi.mean, y = logfdr), color = "red") + 
+    ggrepel::geom_text_repel(
+      data = df.cdi.sig2, 
+      aes(x = cdi.mean, y = logfdr, label = feature.y),
+      max.overlaps = Inf, min.segment.length = 0, size = 2
+    ) + 
+    theme_miko(legend = TRUE) + 
+    labs(
+      x = "Scaled Codependency Index (sCDI)", 
+      y = "-log10(FDR)", 
+      title = paste0(gene, " co-expressed genes", 
+                     ifelse(!is.null(tumor_type), paste0(" in ", tumor_type), ""))
+    )
+  
+  return(list(
+    raw_data = df.cdi.res,
+    summary = df.cdi.sum,
+    significant = df.cdi.sig,
+    plot = plt,
+    genes = df.cdi.sig$feature.y
+  ))
+}
+
+# Run codependency analysis for each gene and tumor type
+cdi_results <- list()
+
+for (gene in GENES_OF_INTEREST) {
+  if (gene %in% rownames(so.merge)) {
+    # Overall analysis
+    message(paste0("Running overall codependency analysis for ", gene))
+    cdi_results[[gene]][["All"]] <- analyze_gene_codependency(gene)
+    print(cdi_results[[gene]][["All"]]$plot)
+    
+    # Stratified by tumor type
+    for (tumor in PRIMARY_TUMORS_TO_ANALYZE) {
+      try({
+              message(paste0("Running codependency analysis for ", gene, " in ", tumor))
+      cdi_results[[gene]][[tumor]] <- analyze_gene_codependency(gene, tumor)
+      print(cdi_results[[gene]][[tumor]]$plot)
+      })
+
+    }
+  }
+}
+```
+
+
+```{r generate gene-association summary plots, fig.width =8, fig.height=7}
+
+df.cdi.cur <- cdi_results$DHODH$All$summary
+df.cdi.cur <- df.cdi.cur[complete.cases(df.cdi.cur), ]
+
+df.cdi.cur$logfdr[df.cdi.cur$cdi.mean < 0] <-df.cdi.cur$logfdr[df.cdi.cur$cdi.mean < 0] *(-1)
+df.cdi.cur <- df.cdi.cur %>%
+  dplyr::mutate(
+    prank = rank(logfdr * sign(cdi.mean), ties.method = "random"))
+
+# highlight.which <- "DHODH"
+highlight.which <- c("MSH6",  "RPAP3", "SCO1" , "GSDME")
+df.highlight <- df.cdi.cur %>% dplyr::filter(feature.y %in% highlight.which)
+
+df.cdi.sig <- df.cdi.cur %>%
+  dplyr::filter(fdr < 0.05, cdi.n > 0.5 * max.cdi, prop.sig > 0.25, cdi.mean > 0) 
+df.cdi.sig <- unique(bind_rows(df.cdi.sig,df.highlight ))
+
+df.cdi.sig2 <-df.cdi.sig %>%
+  dplyr::filter(!grepl("\\.", feature.y)) %>%
+  dplyr::top_n(30, -fdr * prop.sig)
+
+df.cdi.sig2 <- unique(bind_rows(df.cdi.sig2,df.highlight ))
+df.cdi.cur$sig <- df.cdi.cur$feature.y %in% df.cdi.sig$feature.y
+df.cdi.sig$sig <- df.cdi.sig$feature.y %in% df.cdi.sig$feature.y
+df.cdi.cur %>%
+  dplyr::filter(!grepl("\\.", feature.y)) %>%
+  ggplot(aes(x = prank, y = logfdr)) + 
+  scattermore::geom_scattermore(aes(color = sig)) +
+  geom_point(data = df.cdi.sig, aes(x = prank, y = logfdr), color = "tomato") + 
+  ggrepel::geom_text_repel(data = df.cdi.sig2,aes( x = prank, y = logfdr, label = feature.y), max.overlaps = Inf, min.segment.length = 0) + 
+  geom_hline(yintercept = -log10(0.05)) +
+  scale_color_manual(values = c("FALSE" = "grey", "TRUE" = "tomato")) + 
+  theme_miko()
+
+plt <- df.cdi.cur %>%
+  dplyr::filter(!grepl("\\.", feature.y)) %>%
+  ggplot(aes(x = cdi.mean, y = logfdr)) + 
+  scattermore::geom_scattermore(aes(color = sig)) +
+  geom_point(data = df.cdi.sig, aes(x = cdi.mean, y = logfdr), color = "tomato") + 
+  ggrepel::geom_text_repel(data = df.cdi.sig2,aes( x = cdi.mean, y = logfdr, label = feature.y), max.overlaps = Inf, min.segment.length = 0) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  scale_color_manual(values = c("FALSE" = "grey", "TRUE" = "black")) + 
+  theme_miko() + 
+  coord_cartesian(ylim = c(0, max(df.cdi.cur$logfdr)))
+
+plt
+
+# SAVE RESULTS
+# savePDF("DHODH_associations_ALL_260625.pdf", plt, fig.width =8, fig.height=7)
+```
+
+
+
+```{r compare associated genes with VENN DIAGRAMS}
+
+
+gene.sig.all <- list()
+for (i in 1:length(cdi_results)){
+  
+  current.gene <- names(cdi_results)[i]
+  cdi_res_current <- cdi_results[[current.gene]]
+  gene.sig.list <- list()
+  for (j  in 1:length(cdi_res_current)){
+    sub.name <- names(cdi_res_current)[j]
+    df.cdi_subtype <- cdi_res_current[[sub.name]][["summary"]]  
+    max.cdi <- max(df.cdi_subtype$cdi.n)
+    df.cdi_subtype.sig <- df.cdi_subtype %>% dplyr::filter(fdr < 0.05, cdi.n > 0.5 * max.cdi, prop.sig > 0.25, cdi.mean > 0)
+    gene.sig.list[[paste0(current.gene, "-", sub.name)]] <- df.cdi_subtype.sig$feature.y
+  }
+  
+  plt.venn <-ggVennDiagram::ggVennDiagram(gene.sig.list[paste0(current.gene, "-", PRIMARY_TUMORS_TO_ANALYZE)]) + 
+    scale_fill_distiller(palette = "Blues", trans = "log", direction = 1) +
+    labs(title = current.gene)
+print(plt.venn)
+
+gene.sig.all <- c(gene.sig.all,gene.sig.list)
+
+# SAVE VENN DIAGRAMS
+# savePDF(paste0(current.gene, "_venn_diagram_gene_associations_240625.pdf"), plt.venn)
+print(lintersect(gene.sig.list[paste0("DHODH-", PRIMARY_TUMORS_TO_ANALYZE)]))
+  
+}
+
+```
+
+
+
+
+
+```{r pathway-enrichment-analysis, fig.width=15, fig.height=12}
+#' Perform pathway enrichment analysis
+#' @param gene_list List of genes
+#' @param universe Gene universe for enrichment
+#' @param title Analysis title
+run_pathway_enrichment <- function(gene_list, universe, title = "") {
+  
+  show.n <- 10
+  results.hg <- list()
+  results.plots <- list()
+  
+  # Bader comprehensive database
+  hg.res.bader <- runHG(
+    gene.list = gene_list, 
+    species = "Hs", 
+    gene.universe = universe,
+    e2s = T
+  )
+  hg.sum.bader <- summarizeHG(hg.res.bader, show.n = show.n)
+  results.plots$bader <- hg.sum.bader$plot 
+  results.hg$bader <- hg.res.bader
+  
+  # Reactome
+  hg.res.reactome <- runHG(
+    gene.list = gene_list, 
+    species = "Hs", 
+    pathway.db = "Reactome",
+    gene.universe = universe,e2s = T
+  )
+  hg.sum.reactome <- summarizeHG(hg.res.reactome, show.n = show.n)
+  results.plots$reactome <- hg.sum.reactome$plots
+  results.hg$reactome <- hg.res.reactome
+  
+  # KEGG
+  hg.res.kegg <- runHG(
+    gene.list = gene_list, 
+    species = "Hs", 
+    pathway.db = "KEGG",
+    gene.universe = universe,e2s = T
+  )
+  hg.sum.kegg <- summarizeHG(hg.res.kegg, show.n = show.n)
+  results.plots$kegg <- hg.sum.kegg$plots
+  results.hg$kegg <- hg.res.kegg
+  
+  # Gene Ontology
+  hg.res.go <- runHG(
+    gene.list = gene_list, 
+    species = "Hs", 
+    pathway.db = "GO",
+    gene.universe = universe, e2s = T
+  )
+  hg.sum.go <- summarizeHG(hg.res.go, show.n = show.n)
+  results.plots$go <- hg.sum.go$plots
+  results.hg$go <- hg.res.go
+  
+  # MSigDB Hallmark
+  hg.res.hm <- runHG(
+    gene.list = gene_list, 
+    species = "Hs", 
+    pathway.db = "msigdb",
+    gene.universe = universe, e2s = T
+  )
+  hg.sum.hm <- summarizeHG(hg.res.hm, show.n = show.n)
+  results.plots$hm <- hg.sum.hm$plots
+  results.hg$hm <- hg.res.hm
+
+  
+  return(list(
+    plots = results.plots,
+    hg = results.hg
+  ))
+}
+
+# RUN ENRICHMENT ANALYSIS
+gene.sig.all <- gene.sig.all[unlist(lapply(gene.sig.all, length)) > 0]
+enrich_results <- run_pathway_enrichment(
+      gene_list = gene.sig.all,
+      universe = cdi_results[["DHODH"]][["All"]][["summary"]]$feature.y,
+      title = NULL)
+
+
+```
+```{r network enrichments, fig.width=20, fig.height=4}
+
+all.db <- names(enrich_results$plots)
+all.subsets <- names(enrich_results$plots$bader)
+
+plot.list <- list()
+for (i in 1:length(all.subsets)){
+  plt.components <- list()
+  for (j in 1:length(all.db)){
+    plt.components <- c(plt.components, list(enrich_results$plots[[all.db[j]]][all.subsets[i]][[1]] + labs(title = all.db[j]))  )
+  }
+  plot.list[[all.subsets[i]]] <- plt.components
+  
+  plt.combo <- cowplot::plot_grid(plotlist = plt.components, nrow = 1)
+  print(plt.combo)
+  
+  # SAVE ENRICHMENT PLOTS
+  # savePDF(paste0("Enrichment_", all.subsets[i], "_250625.pdf"), plt.combo, fig.width=20, fig.height=4)
+}
+
+```
+
+```{r enrichment networks, fig.width= 15, fig.height=15}
+
+
+which.subset <- paste0("DHODH-", PRIMARY_TUMORS_TO_ANALYZE)
+current.set <- gene.sig.all[which.subset]
+current.res <- enrich_results[["hg"]][["bader"]][names(current.set)]
+hg.net <- netHG(hg.res = current.res, gene.list = current.set, gene.universe = cdi_results[["GSDME"]][["All"]][["summary"]]$feature.y, species = "Hs", fdr.filter = 0.2,
+edge.threshold = 0.25, cex_line = 0.2, pie = "Count", verbose = T)
+col.pal <- scales::hue_pal()(8)
+col.pal <- col.pal[c(1,3,4)]
+names(col.pal) <- which.subset
+hg.net$net.plot.nolabel <- hg.net$net.plot.nolabel + scale_fill_manual(values = col.pal)
+hg.net$net.plot.label <- hg.net$net.plot.label + scale_fill_manual(values = col.pal)
+
+hg.net$net.plot.nolabel
+hg.net$net.plot.label
+
+# SAVE NETWORKS
+# savePDF("DHODH_network_nolabel_250625.pdf", hg.net$net.plot.nolabel, fig.width= 15, fig.height=15)
+# savePDF("DHODH_network_label_25062.pdf", hg.net$net.plot.label, fig.width= 15, fig.height=15)
+
+```
+
+
